@@ -1,6 +1,6 @@
 // =====================================================================
 // 社内会議室予約アプリ — 本番版
-// Google Calendar API 連携, 認証, リアルタイム空き状況取得を含む
+// Google Calendar API 連携、認証、リアルタイム空き状況取得を含む
 // =====================================================================
 
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
@@ -14,15 +14,15 @@ import {
 // =====================================================================
 
 const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || '';
-const COMPANY_DOMAIN   = import.meta.env.VITE_COMPANY_DOMAIN || 'archetype.vc'; // 例: 'yourcompany.com'
+const COMPANY_DOMAIN   = import.meta.env.VITE_COMPANY_DOMAIN || ''; // 例: 'yourcompany.com'
 
 // 会議室マスタ。calendarId は Google Workspace でリソース登録した会議室のメールアドレス
 const ROOMS = [
-  { id: 1, name: '4F会議室', reading: 'ATV-4F-Meeting Room', capacity: 8,  floor: '4F', equipment: ['プロジェクター', 'ホワイトボード', 'Web会議用'], calendarId: import.meta.env.VITE_ROOM_1_CAL_ID },
-  { id: 2, name: '会議室側Phone Booth', reading: 'ATV-4F-Phone Booth',  capacity: 1,  floor: '4F', equipment: ['Web会議用'],          calendarId: import.meta.env.VITE_ROOM_2_CAL_ID },
-  { id: 3, name: '窓側Phone Booth', reading: 'ATV-4F-Phone Booth_Window',   capacity: 1,  floor: '4F', equipment: ['Web会議用'],          calendarId: import.meta.env.VITE_ROOM_3_CAL_ID },
-  { id: 4, name: '4Fソファ席', reading: 'ATV-4F-Sofa',  capacity: 4, floor: '4F', equipment: ['プロジェクター'], calendarId: import.meta.env.VITE_ROOM_4_CAL_ID },
-  { id: 5, name: '3F会議室', reading: 'ATV-3F-Third Floor',   capacity: 20,  floor: '3F', equipment: ['プロジェクター', 'ホワイトボード', 'Web会議用'],               calendarId: import.meta.env.VITE_ROOM_5_CAL_ID },
+  { id: 1, name: '4F会議室', reading: 'atv-4f-meeting room', capacity: 8,  floor: '4F', equipment: ['プロジェクター', 'ホワイトボード'], calendarId: import.meta.env.VITE_ROOM_1_CAL_ID },
+  { id: 2, name: '会議室側Phone Booth', reading: 'atv-4f-phone booth',  capacity: 6,  floor: '4F', equipment: ['web会議用'],          calendarId: import.meta.env.VITE_ROOM_2_CAL_ID },
+  { id: 3, name: '窓側Phone Booth', reading: 'atv-4f-phone booth_window',   capacity: 4,  floor: '4F', equipment: ['web会議用'],          calendarId: import.meta.env.VITE_ROOM_3_CAL_ID },
+  { id: 4, name: '4Fソファ席', reading: 'atv-4f-sofa',  capacity: 14, floor: '4F', equipment: ['プロジェクター'], calendarId: import.meta.env.VITE_ROOM_4_CAL_ID },
+  { id: 5, name: '3F会議室', reading: 'atv-3f-third floor',   capacity: 2,  floor: '3F', equipment: ['プロジェクター', 'ホワイトボード'],               calendarId: import.meta.env.VITE_ROOM_5_CAL_ID },
 ].filter(r => r.calendarId); // calendarId が未設定の会議室は表示しない
 
 const SCOPES = 'https://www.googleapis.com/auth/calendar.readonly openid profile email';
@@ -451,6 +451,7 @@ function FilterBar({ filter, setFilter, availableCount }) {
     { id: 'free', label: `空き ${availableCount}` },
     { id: '3F',   label: '3F' },
     { id: '4F',   label: '4F' },
+    { id: '5F',   label: '5F' },
   ];
   return (
     <div className="kr-filter">
@@ -829,7 +830,7 @@ function GlobalStyles() {
       .kr-status-soon .kr-status-dot { background: var(--kogane); }
       @keyframes krPulse { 0% { box-shadow: 0 0 0 0 rgba(93, 122, 58, 0.55); } 70% { box-shadow: 0 0 0 8px rgba(93, 122, 58, 0); } 100% { box-shadow: 0 0 0 0 rgba(93, 122, 58, 0); } }
       .kr-card-floor { font-family: var(--mono); font-size: 10px; letter-spacing: 0.18em; color: var(--ink-mute); }
-      .kr-card-name { display: flex; align-items: baseline; gap: 12px; margin-bottom: 12px; }
+      .kr-card-name { display: flex; flex-direction: column; gap: 4px; margin-bottom: 12px; }
       .kr-card-kanji { font-family: var(--serif); font-weight: 700; font-size: 38px; line-height: 1; letter-spacing: 0.02em; color: var(--ink); }
       .kr-card-romaji { font-family: var(--mono); font-size: 11px; letter-spacing: 0.18em; color: var(--ink-mute); text-transform: lowercase; }
       .kr-card-body { font-size: 13px; }
@@ -876,7 +877,7 @@ function GlobalStyles() {
       .kr-sheet-close:hover { color: var(--ink); border-color: var(--ink); }
       .kr-sheet-head { padding: 24px 24px 20px; border-bottom: 1px solid var(--border-soft); }
       .kr-sheet-eyebrow { font-family: var(--mono); font-size: 10px; letter-spacing: 0.18em; color: var(--matcha); text-transform: uppercase; margin-bottom: 10px; }
-      .kr-sheet-room { display: flex; align-items: baseline; gap: 12px; }
+      .kr-sheet-room { display: flex; flex-direction: column; gap: 6px; }
       .kr-sheet-room-name { font-family: var(--serif); font-weight: 700; font-size: 42px; line-height: 1; color: var(--ink); }
       .kr-sheet-room-romaji { font-family: var(--mono); font-size: 11px; letter-spacing: 0.18em; color: var(--ink-mute); }
       .kr-sheet-meta { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; font-size: 11px; color: var(--ink-soft); margin-top: 12px; }
