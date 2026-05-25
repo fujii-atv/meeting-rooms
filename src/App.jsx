@@ -18,6 +18,7 @@ const COMPANY_DOMAIN   = import.meta.env.VITE_COMPANY_DOMAIN || ''; // 例: 'you
 
 // 会議室マスタ。calendarId は Google Workspace でリソース登録した会議室のメールアドレス
 const ROOMS = [
+const ROOMS = [
   { id: 1, name: '4F会議室', reading: 'atv-4f-meeting room', capacity: 8,  floor: '4F', equipment: ['プロジェクター', 'ホワイトボード'], calendarId: import.meta.env.VITE_ROOM_1_CAL_ID },
   { id: 2, name: '会議室側Phone Booth', reading: 'atv-4f-phone booth',  capacity: 6,  floor: '4F', equipment: ['web会議用'],          calendarId: import.meta.env.VITE_ROOM_2_CAL_ID },
   { id: 3, name: '窓側Phone Booth', reading: 'atv-4f-phone booth_window',   capacity: 4,  floor: '4F', equipment: ['web会議用'],          calendarId: import.meta.env.VITE_ROOM_3_CAL_ID },
@@ -107,10 +108,31 @@ function loadGisScript() {
 function useGoogleAuth() {
   const [ready, setReady] = useState(false);
   const [token, setToken] = useState(null);
-  const [tokenExpiresAt, setTokenExpiresAt] = useState(0);
   const [user, setUser] = useState(null);
   const [authError, setAuthError] = useState(null);
+
+  // ref で同期的に最新のトークンを参照可能にする（setState だと反映に時間差がある）
+  const tokenRef = useRef(null);
+  const tokenExpiresAtRef = useRef(0);
   const tokenClientRef = useRef(null);
+  const pendingRequestRef = useRef(null);
+  const userFetchedRef = useRef(false);
+
+  // 新しいトークンを ref と state の両方に反映
+  const applyNewToken = useCallback((accessToken, expiresIn) => {
+    tokenRef.current = accessToken;
+    tokenExpiresAtRef.current = Date.now() + (expiresIn - 60) * 1000;
+    setToken(accessToken);
+    if (!userFetchedRef.current) {
+      userFetchedRef.current = true;
+      fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+        headers: { Authorization: `Bearer ${accessToken}` }
+      })
+        .then(r => r.json())
+        .then(u => setUser({ name: u.name, email: u.email, picture: u.picture }))
+        .catch(() => {});
+    }
+  }, []);
 
   useEffect(() => {
     if (!GOOGLE_CLIENT_ID) {
@@ -122,69 +144,109 @@ function useGoogleAuth() {
         tokenClientRef.current = window.google.accounts.oauth2.initTokenClient({
           client_id: GOOGLE_CLIENT_ID,
           scope: SCOPES,
-          hd: COMPANY_DOMAIN || undefined, // 社外ドメインのアカウントを拒否
+          hd: COMPANY_DOMAIN || undefined,
           callback: (resp) => {
             if (resp.error) {
-              setAuthError(resp.error_description || resp.error);
+              const errMsg = resp.error_description || resp.error;
+              if (pendingRequestRef.current) {
+                pendingRequestRef.current.reject(new Error(errMsg));
+                pendingRequestRef.current = null;
+              } else {
+                setAuthError(errMsg);
+              }
               return;
             }
-            setToken(resp.access_token);
-            setTokenExpiresAt(Date.now() + (resp.expires_in - 60) * 1000);
-            // ユーザー情報を取得
-            fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
-              headers: { Authorization: `Bearer ${resp.access_token}` }
-            })
-              .then(r => r.json())
-              .then(u => setUser({ name: u.name, email: u.email, picture: u.picture }))
-              .catch(() => {});
+            applyNewToken(resp.access_token, resp.expires_in);
+            if (pendingRequestRef.current) {
+              pendingRequestRef.current.resolve(resp.access_token);
+              pendingRequestRef.current = null;
+            }
           },
-          error_callback: (err) => setAuthError(err.message || 'ログインに失敗しました'),
+          error_callback: (err) => {
+            const errMsg = err.message || err.type || 'ログインに失敗しました';
+            if (pendingRequestRef.current) {
+              pendingRequestRef.current.reject(new Error(errMsg));
+              pendingRequestRef.current = null;
+            } else {
+              setAuthError(errMsg);
+            }
+          },
         });
         setReady(true);
       })
       .catch(err => setAuthError(err.message));
-  }, []);
+  }, [applyNewToken]);
 
   const signIn = useCallback(() => {
     if (!tokenClientRef.current) return;
     setAuthError(null);
+    userFetchedRef.current = false; // 明示ログイン時はユーザー情報も取り直し
     tokenClientRef.current.requestAccessToken({ prompt: 'consent' });
   }, []);
 
-  const silentRefresh = useCallback(() => {
-    if (!tokenClientRef.current) return;
-    tokenClientRef.current.requestAccessToken({ prompt: '' });
+  // 静かにトークンを更新する。新しいトークンで解決する Promise を返す
+  const refreshToken = useCallback(() => {
+    if (!tokenClientRef.current) return Promise.reject(new Error('認証が初期化されていません'));
+    if (pendingRequestRef.current) return pendingRequestRef.current.promise;
+
+    let resolveFn, rejectFn;
+    const promise = new Promise((resolve, reject) => { resolveFn = resolve; rejectFn = reject; });
+    pendingRequestRef.current = { promise, resolve: resolveFn, reject: rejectFn };
+
+    try {
+      tokenClientRef.current.requestAccessToken({ prompt: '' });
+    } catch (e) {
+      pendingRequestRef.current = null;
+      return Promise.reject(e);
+    }
+
+    // 15秒で応答が無ければタイムアウト
+    setTimeout(() => {
+      if (pendingRequestRef.current?.promise === promise) {
+        pendingRequestRef.current.reject(new Error('トークン更新がタイムアウトしました'));
+        pendingRequestRef.current = null;
+      }
+    }, 15000);
+
+    return promise;
   }, []);
 
+  // 有効なトークンを取得する。期限切れ間近 or forceRefresh なら更新を挟む
+  const getValidToken = useCallback(async ({ forceRefresh = false } = {}) => {
+    if (!forceRefresh && tokenRef.current && tokenExpiresAtRef.current > Date.now() + 60000) {
+      return tokenRef.current;
+    }
+    return refreshToken();
+  }, [refreshToken]);
+
   const signOut = useCallback(() => {
-    if (token) window.google.accounts.oauth2.revoke(token, () => {});
-    setToken(null); setUser(null); setTokenExpiresAt(0);
-  }, [token]);
+    if (tokenRef.current) {
+      try { window.google.accounts.oauth2.revoke(tokenRef.current, () => {}); } catch (e) {}
+    }
+    tokenRef.current = null;
+    tokenExpiresAtRef.current = 0;
+    userFetchedRef.current = false;
+    setToken(null);
+    setUser(null);
+    setAuthError(null);
+  }, []);
 
-  // トークン期限切れ前に静かに更新
-  useEffect(() => {
-    if (!token || !tokenExpiresAt) return;
-    const ms = tokenExpiresAt - Date.now();
-    if (ms <= 0) { silentRefresh(); return; }
-    const t = setTimeout(silentRefresh, ms);
-    return () => clearTimeout(t);
-  }, [token, tokenExpiresAt, silentRefresh]);
-
-  return { ready, token, user, authError, signIn, signOut };
+  return { ready, token, user, authError, signIn, signOut, getValidToken };
 }
 
 // =====================================================================
 // 会議室の予約状況を取得するフック
 // =====================================================================
 
-function useRoomBookings(token, rooms) {
+function useRoomBookings(getValidToken, isAuthed, rooms) {
   const [bookings, setBookings] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const [sessionExpired, setSessionExpired] = useState(false);
   const [lastUpdated, setLastUpdated] = useState(null);
 
   const fetchAll = useCallback(async () => {
-    if (!token) return;
+    if (!isAuthed) return;
     setError(null);
     try {
       const t0 = new Date(); t0.setHours(0, 0, 0, 0);
@@ -192,18 +254,37 @@ function useRoomBookings(token, rooms) {
       const timeMin = encodeURIComponent(t0.toISOString());
       const timeMax = encodeURIComponent(t1.toISOString());
 
-      const results = await Promise.all(rooms.map(async (room) => {
+      const fetchOne = (room, accessToken) => {
         const url = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(room.calendarId)}/events`
           + `?timeMin=${timeMin}&timeMax=${timeMax}`
           + `&singleEvents=true&orderBy=startTime&maxResults=50`;
-        const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+        return fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
+      };
+
+      let accessToken = await getValidToken();
+      let responses = await Promise.all(rooms.map(r => fetchOne(r, accessToken)));
+
+      // 401 が混ざっていたらトークンを強制更新して1回だけ再試行
+      if (responses.some(res => res.status === 401)) {
+        try {
+          accessToken = await getValidToken({ forceRefresh: true });
+        } catch (refreshErr) {
+          // 静かな更新も失敗 → セッション切れ。再ログインが必要
+          setSessionExpired(true);
+          throw new Error('セッションの有効期限が切れました。再ログインしてください。');
+        }
+        responses = await Promise.all(rooms.map(r => fetchOne(r, accessToken)));
+      }
+
+      const results = await Promise.all(responses.map(async (res, idx) => {
+        const room = rooms[idx];
         if (!res.ok) {
           const body = await res.text();
           throw new Error(`${room.name}（${room.calendarId}）の取得に失敗: ${res.status} ${body}`);
         }
         const data = await res.json();
         return (data.items || [])
-          .filter(ev => ev.start?.dateTime && ev.end?.dateTime) // 終日イベントは除外
+          .filter(ev => ev.start?.dateTime && ev.end?.dateTime)
           .filter(ev => ev.status !== 'cancelled')
           .map(ev => ({
             id: ev.id,
@@ -217,22 +298,34 @@ function useRoomBookings(token, rooms) {
 
       setBookings(results.flat());
       setLastUpdated(new Date());
+      setSessionExpired(false);
     } catch (e) {
-      setError(e.message);
+      setError(e.message || String(e));
     } finally {
       setLoading(false);
     }
-  }, [token, rooms]);
+  }, [getValidToken, isAuthed, rooms]);
 
+  // 定期ポーリング
   useEffect(() => {
-    if (!token) return;
+    if (!isAuthed) return;
     setLoading(true);
     fetchAll();
     const t = setInterval(fetchAll, REFRESH_INTERVAL_MS);
     return () => clearInterval(t);
-  }, [token, fetchAll]);
+  }, [isAuthed, fetchAll]);
 
-  return { bookings, loading, error, lastUpdated, refresh: fetchAll };
+  // タブが再表示されたらすぐに再取得（バックグラウンド時はsetIntervalが間引かれるため）
+  useEffect(() => {
+    if (!isAuthed) return;
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') fetchAll();
+    };
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => document.removeEventListener('visibilitychange', handleVisibility);
+  }, [isAuthed, fetchAll]);
+
+  return { bookings, loading, error, sessionExpired, lastUpdated, refresh: fetchAll };
 }
 
 // =====================================================================
@@ -274,7 +367,7 @@ function Dashboard({ auth }) {
   const [now, setNow] = useState(new Date());
   const [bookingRoom, setBookingRoom] = useState(null);
   const [filter, setFilter] = useState('all');
-  const { bookings, loading, error, lastUpdated, refresh } = useRoomBookings(auth.token, ROOMS);
+  const { bookings, loading, error, sessionExpired, lastUpdated, refresh } = useRoomBookings(auth.getValidToken, !!auth.token, ROOMS);
 
   useEffect(() => {
     const t = setInterval(() => setNow(new Date()), 30000);
@@ -336,12 +429,18 @@ function Dashboard({ auth }) {
           <div className="kr-error-banner">
             <AlertCircle size={14} strokeWidth={1.8} />
             <div>
-              <strong>取得エラー:</strong> {error}
-              <div className="kr-error-hint">
-                権限不足の場合は、Google Workspace 管理者に「リソース（会議室）への閲覧権限」を確認してください。
-              </div>
+              <strong>{sessionExpired ? 'セッションが切れました:' : '取得エラー:'}</strong> {error}
+              {!sessionExpired && (
+                <div className="kr-error-hint">
+                  権限不足の場合は、Google Workspace 管理者に「リソース（会議室）への閲覧権限」を確認してください。
+                </div>
+              )}
             </div>
-            <button className="kr-icon-btn" onClick={refresh}><RefreshCw size={12} /></button>
+            {sessionExpired ? (
+              <button className="kr-error-relogin" onClick={auth.signIn}>再ログイン</button>
+            ) : (
+              <button className="kr-icon-btn" onClick={refresh}><RefreshCw size={12} /></button>
+            )}
           </div>
         )}
 
@@ -933,6 +1032,8 @@ function GlobalStyles() {
       .kr-error-banner { display: flex; align-items: flex-start; gap: 10px; background: var(--beni-bg); border-left: 3px solid var(--beni); color: var(--beni-ink); padding: 12px 14px; border-radius: 3px; font-size: 12px; margin-bottom: 18px; line-height: 1.5; }
       .kr-error-banner > div { flex: 1; }
       .kr-error-hint { font-size: 10px; margin-top: 4px; opacity: 0.85; }
+      .kr-error-relogin { background: var(--beni-ink); color: var(--bg); border: none; padding: 6px 14px; border-radius: 3px; font-family: inherit; font-size: 11px; font-weight: 600; letter-spacing: 0.04em; cursor: pointer; white-space: nowrap; transition: background 0.15s; }
+      .kr-error-relogin:hover { background: var(--ink); }
       .kr-error-screen { max-width: 420px; text-align: center; color: var(--beni-ink); }
       .kr-error-screen h2 { font-family: var(--serif); font-weight: 600; margin: 12px 0 6px; }
       .kr-error-screen p { color: var(--ink-soft); font-size: 13px; margin: 0 0 24px; line-height: 1.6; }
