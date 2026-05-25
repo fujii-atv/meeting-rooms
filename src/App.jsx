@@ -18,7 +18,6 @@ const COMPANY_DOMAIN   = import.meta.env.VITE_COMPANY_DOMAIN || ''; // 例: 'you
 
 // 会議室マスタ。calendarId は Google Workspace でリソース登録した会議室のメールアドレス
 const ROOMS = [
-const ROOMS = [
   { id: 1, name: '4F会議室', reading: 'atv-4f-meeting room', capacity: 8,  floor: '4F', equipment: ['プロジェクター', 'ホワイトボード'], calendarId: import.meta.env.VITE_ROOM_1_CAL_ID },
   { id: 2, name: '会議室側Phone Booth', reading: 'atv-4f-phone booth',  capacity: 6,  floor: '4F', equipment: ['web会議用'],          calendarId: import.meta.env.VITE_ROOM_2_CAL_ID },
   { id: 3, name: '窓側Phone Booth', reading: 'atv-4f-phone booth_window',   capacity: 4,  floor: '4F', equipment: ['web会議用'],          calendarId: import.meta.env.VITE_ROOM_3_CAL_ID },
