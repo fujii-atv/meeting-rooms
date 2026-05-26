@@ -246,21 +246,36 @@ function useRoomBookings(getValidToken, isAuthed, rooms) {
 
   const fetchAll = useCallback(async () => {
     if (!isAuthed) return;
-    setError(null);
+
+    const t0 = new Date(); t0.setHours(0, 0, 0, 0);
+    const t1 = new Date(); t1.setHours(23, 59, 59, 999);
+    const timeMin = encodeURIComponent(t0.toISOString());
+    const timeMax = encodeURIComponent(t1.toISOString());
+
+    const fetchOne = (room, accessToken) => {
+      const url = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(room.calendarId)}/events`
+        + `?timeMin=${timeMin}&timeMax=${timeMax}`
+        + `&singleEvents=true&orderBy=startTime&maxResults=50`;
+      return fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
+    };
+
+    // ステップ1: 有効なトークンを取得する
+    // ここで失敗する典型ケース: サードパーティCookieが無効でサイレント更新ができない（Safari等）
+    // → 「セッションが切れました」バナーを出して再ログインボタンを表示
+    let accessToken;
     try {
-      const t0 = new Date(); t0.setHours(0, 0, 0, 0);
-      const t1 = new Date(); t1.setHours(23, 59, 59, 999);
-      const timeMin = encodeURIComponent(t0.toISOString());
-      const timeMax = encodeURIComponent(t1.toISOString());
+      accessToken = await getValidToken();
+    } catch (refreshErr) {
+      setSessionExpired(true);
+      setError('セッションの更新が必要です。');
+      setLoading(false);
+      return;
+    }
 
-      const fetchOne = (room, accessToken) => {
-        const url = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(room.calendarId)}/events`
-          + `?timeMin=${timeMin}&timeMax=${timeMax}`
-          + `&singleEvents=true&orderBy=startTime&maxResults=50`;
-        return fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
-      };
-
-      let accessToken = await getValidToken();
+    // ステップ2: 実際にAPIから予約情報を取得
+    setError(null);
+    setSessionExpired(false);
+    try {
       let responses = await Promise.all(rooms.map(r => fetchOne(r, accessToken)));
 
       // 401 が混ざっていたらトークンを強制更新して1回だけ再試行
@@ -268,9 +283,8 @@ function useRoomBookings(getValidToken, isAuthed, rooms) {
         try {
           accessToken = await getValidToken({ forceRefresh: true });
         } catch (refreshErr) {
-          // 静かな更新も失敗 → セッション切れ。再ログインが必要
           setSessionExpired(true);
-          throw new Error('セッションの有効期限が切れました。再ログインしてください。');
+          throw new Error('セッションの更新が必要です。');
         }
         responses = await Promise.all(rooms.map(r => fetchOne(r, accessToken)));
       }
@@ -297,7 +311,6 @@ function useRoomBookings(getValidToken, isAuthed, rooms) {
 
       setBookings(results.flat());
       setLastUpdated(new Date());
-      setSessionExpired(false);
     } catch (e) {
       setError(e.message || String(e));
     } finally {
