@@ -248,6 +248,10 @@ function useRoomBookings(getValidToken, isAuthed, rooms) {
   const [sessionExpired, setSessionExpired] = useState(false);
   const [lastUpdated, setLastUpdated] = useState(null);
 
+  // 楽観的に追加した予約を追跡する。サーバーが返すまで表示し続けるために使う。
+  // Map<eventId, { booking, addedAt }>
+  const optimisticBookingsRef = useRef(new Map());
+
   const fetchAll = useCallback(async () => {
     if (!isAuthed) return;
 
@@ -313,7 +317,26 @@ function useRoomBookings(getValidToken, isAuthed, rooms) {
           }));
       }));
 
-      setBookings(results.flat());
+      const serverBookings = results.flat();
+
+      // サーバーがまだインデックスしていない楽観的予約をマージする。
+      // サーバーが返してきた予約は「確定済み」なので追跡から外す。
+      // 5分以上経っても来ていないものは安全のため切り捨てる（通常起こらない）。
+      const serverIds = new Set(serverBookings.map(b => b.id));
+      const nowMs = Date.now();
+      const STALE_MS = 5 * 60 * 1000;
+      const stillPending = [];
+      for (const [id, entry] of optimisticBookingsRef.current.entries()) {
+        if (serverIds.has(id)) {
+          optimisticBookingsRef.current.delete(id); // 確定したので追跡終了
+        } else if (nowMs - entry.addedAt > STALE_MS) {
+          optimisticBookingsRef.current.delete(id); // 5分超は諦める
+        } else {
+          stillPending.push(entry.booking);
+        }
+      }
+
+      setBookings([...serverBookings, ...stillPending]);
       setLastUpdated(new Date());
     } catch (e) {
       setError(e.message || String(e));
@@ -385,11 +408,45 @@ function useRoomBookings(getValidToken, isAuthed, rooms) {
       throw new Error('会議室の予約が承認されませんでした。直前に他の予約が入った可能性があります。');
     }
 
-    // 予約一覧を即座に再取得（ポーリング待ちにしない）
-    await fetchAll();
+    // 楽観的更新: Google APIのインデックス完了を待たず、即座にローカルの予約一覧に追加
+    // 同時に追跡用Refにも登録し、サーバーが返すまで表示し続けるようにする
+    const targetRoom = rooms.find(r => r.calendarId === roomCalendarId);
+    if (targetRoom) {
+      const optimisticBooking = {
+        id: created.id,
+        roomId: targetRoom.id,
+        title: created.summary || '(タイトルなし)',
+        organizer: created.organizer?.displayName
+          || created.creator?.displayName
+          || created.organizer?.email
+          || created.creator?.email
+          || 'あなた',
+        start: new Date(created.start.dateTime),
+        end:   new Date(created.end.dateTime),
+      };
+      // 追跡開始（fetchAllのマージで使う）
+      optimisticBookingsRef.current.set(created.id, {
+        booking: optimisticBooking,
+        addedAt: Date.now(),
+      });
+      setBookings(prev => {
+        // 既に同じIDがあれば差し替え（防御的）
+        const filtered = prev.filter(b => b.id !== created.id);
+        return [...filtered, optimisticBooking];
+      });
+      setLastUpdated(new Date());
+    }
+
+    // 複数のタイミングでバックグラウンド再取得を試みる。
+    // Googleカレンダーのインデックス完了タイミングは数秒〜十数秒のブレがあるため、
+    // 段階的にリトライすることで早い段階で確定状態に切り替わる。
+    // 仮にどの再取得でも未反映だった場合も、楽観的予約はマージロジックで表示され続ける。
+    [2000, 5000, 10000, 20000].forEach(delay => {
+      setTimeout(() => { fetchAll().catch(() => {}); }, delay);
+    });
 
     return created;
-  }, [getValidToken, fetchAll]);
+  }, [getValidToken, fetchAll, rooms]);
 
   return { bookings, loading, error, sessionExpired, lastUpdated, refresh: fetchAll, createBooking };
 }
@@ -780,9 +837,32 @@ function BookingSheet({ room, bookings, now, userEmail, createBooking, onClose }
   const computedStart = useMemo(() => {
     if (!room) return null;
     if (customStart) return customStart;
+
+    // 起点: 現在使用中なら現在予約の終了時刻、空いていれば次の15分刻み
+    let candidate;
     const cur = currentBooking(room.id, bookings, now);
-    if (cur) return new Date(cur.end);
-    return roundToNext15(now);
+    if (cur) {
+      candidate = new Date(cur.end);
+    } else {
+      candidate = roundToNext15(now);
+    }
+
+    // 「最短空き時間」: 候補時刻から最低60分（=初期の利用時間）連続で空いているかをチェック。
+    // 衝突する予約があれば、その終了時刻まで進めて再度チェック。
+    // これにより、デフォルト状態では衝突しない最も早い時刻が提示される。
+    const minSlotMinutes = 60;
+    const roomBookings = bookings
+      .filter(b => b.roomId === room.id)
+      .sort((a, b) => a.start - b.start);
+
+    for (let i = 0; i < 100; i++) { // 安全のためのループ上限
+      const candidateEnd = new Date(candidate.getTime() + minSlotMinutes * 60000);
+      const conflictBooking = roomBookings.find(b => b.start < candidateEnd && b.end > candidate);
+      if (!conflictBooking) return candidate;
+      candidate = new Date(conflictBooking.end);
+    }
+
+    return candidate;
   }, [room, customStart, bookings, now]);
 
   const computedEnd = useMemo(() => {
@@ -875,6 +955,13 @@ function BookingSheet({ room, bookings, now, userEmail, createBooking, onClose }
         </div>
 
         <div className="kr-sheet-body">
+          {conflict && (
+            <div className="kr-warn">
+              <strong>時間が重複しています</strong>
+              <div>「{conflict.title}」（{fmtTime(conflict.start)}〜{fmtTime(conflict.end)} / {conflict.organizer}）と被ります。開始時刻または利用時間を調整してください。</div>
+            </div>
+          )}
+
           <div className="kr-field">
             <div className="kr-field-row">
               <div className="kr-field-label">開始時刻</div>
@@ -901,9 +988,7 @@ function BookingSheet({ room, bookings, now, userEmail, createBooking, onClose }
                 ? '⚠ 開始時刻が現在より前です'
                 : customStart
                   ? '手動で設定済み'
-                  : currentBooking(room.id, bookings, now)
-                    ? '現在の予約終了直後から（タップして変更可能）'
-                    : '次の15分から自動セット（タップして変更可能）'}
+                  : '会議室の最短空き時間を自動セット（タップして変更可能）'}
             </div>
           </div>
 
@@ -927,13 +1012,6 @@ function BookingSheet({ room, bookings, now, userEmail, createBooking, onClose }
             <div className="kr-field-label">タイトル <span className="kr-field-optional">（省略可）</span></div>
             <input className="kr-input" type="text" value={title} onChange={e => setTitle(e.target.value)} placeholder={`${userLabel}のミーティング`} />
           </div>
-
-          {conflict && (
-            <div className="kr-warn">
-              <strong>時間が重複しています</strong>
-              <div>「{conflict.title}」（{fmtTime(conflict.start)}〜{fmtTime(conflict.end)} / {conflict.organizer}）と被ります。利用時間を調整してください。</div>
-            </div>
-          )}
 
           <div className="kr-preview">
             <div className="kr-preview-label">Googleカレンダーに登録される内容</div>
