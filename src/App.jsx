@@ -6,7 +6,7 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import {
   Users, X, ArrowUpRight, Plus, Minus, RefreshCw, LogIn, LogOut,
-  AlertCircle, ChevronRight, Sparkles, Loader2
+  AlertCircle, ChevronRight, Sparkles, Loader2, Check
 } from 'lucide-react';
 
 // =====================================================================
@@ -28,7 +28,8 @@ const ROOMS = [
 // ROOMSから階数を自動抽出（重複除去・ソート済み）。会議室を増減すると自動的にフィルターも追従する
 const FLOORS = [...new Set(ROOMS.map(r => r.floor))].sort();
 
-const SCOPES = 'https://www.googleapis.com/auth/calendar.readonly openid profile email';
+// calendar.events スコープ＝書き込み可。API経由でイベント作成するため必須
+const SCOPES = 'https://www.googleapis.com/auth/calendar.events openid profile email';
 const REFRESH_INTERVAL_MS = 60 * 1000; // 1分ごとに予約状況を再取得
 
 const DURATIONS = [
@@ -340,7 +341,57 @@ function useRoomBookings(getValidToken, isAuthed, rooms) {
     return () => document.removeEventListener('visibilitychange', handleVisibility);
   }, [isAuthed, fetchAll]);
 
-  return { bookings, loading, error, sessionExpired, lastUpdated, refresh: fetchAll };
+  // 予約作成（Calendar APIに直接POST）
+  const createBooking = useCallback(async ({ title, start, end, location, description, roomCalendarId }) => {
+    const accessToken = await getValidToken();
+
+    const event = {
+      summary: title,
+      start: { dateTime: start.toISOString(), timeZone: 'Asia/Tokyo' },
+      end:   { dateTime: end.toISOString(),   timeZone: 'Asia/Tokyo' },
+      location,
+      description,
+      attendees: [{ email: roomCalendarId }],
+    };
+
+    // sendUpdates=none: 招待メールは送らない（会議室リソースは自動でaccept/declineする）
+    const res = await fetch(
+      'https://www.googleapis.com/calendar/v3/calendars/primary/events?sendUpdates=none',
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(event),
+      }
+    );
+
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.error?.message || `予約に失敗しました (HTTP ${res.status})`);
+    }
+
+    const created = await res.json();
+
+    // 会議室リソースは自動でaccept/declineする。declineの場合はイベントを削除して失敗扱いに
+    const roomAttendee = created.attendees?.find(a => a.email === roomCalendarId);
+    if (roomAttendee?.responseStatus === 'declined') {
+      // 会議室が拒否（衝突など）→ 作ったイベントを取り消し
+      await fetch(
+        `https://www.googleapis.com/calendar/v3/calendars/primary/events/${created.id}?sendUpdates=none`,
+        { method: 'DELETE', headers: { Authorization: `Bearer ${accessToken}` } }
+      ).catch(() => {});
+      throw new Error('会議室の予約が承認されませんでした。直前に他の予約が入った可能性があります。');
+    }
+
+    // 予約一覧を即座に再取得（ポーリング待ちにしない）
+    await fetchAll();
+
+    return created;
+  }, [getValidToken, fetchAll]);
+
+  return { bookings, loading, error, sessionExpired, lastUpdated, refresh: fetchAll, createBooking };
 }
 
 // =====================================================================
@@ -382,7 +433,7 @@ function Dashboard({ auth }) {
   const [now, setNow] = useState(new Date());
   const [bookingRoom, setBookingRoom] = useState(null);
   const [filter, setFilter] = useState('all');
-  const { bookings, loading, error, sessionExpired, lastUpdated, refresh } = useRoomBookings(auth.getValidToken, !!auth.token, ROOMS);
+  const { bookings, loading, error, sessionExpired, lastUpdated, refresh, createBooking } = useRoomBookings(auth.getValidToken, !!auth.token, ROOMS);
 
   useEffect(() => {
     const t = setInterval(() => setNow(new Date()), 30000);
@@ -495,6 +546,7 @@ function Dashboard({ auth }) {
         bookings={bookings}
         now={now}
         userEmail={auth.user?.email}
+        createBooking={createBooking}
         onClose={() => setBookingRoom(null)}
       />
     </div>
@@ -717,16 +769,21 @@ function TimelineStrip({ bookings, now }) {
 // 予約ボトムシート
 // =====================================================================
 
-function BookingSheet({ room, bookings, now, userEmail, onClose }) {
+function BookingSheet({ room, bookings, now, userEmail, createBooking, onClose }) {
   const [duration, setDuration] = useState(60);
   const [title, setTitle] = useState('');
+  const [customStart, setCustomStart] = useState(null); // 手動設定された開始時刻（nullなら自動計算）
+  const [submitting, setSubmitting] = useState(false);
+  const [submitted, setSubmitted] = useState(false);
+  const [submitError, setSubmitError] = useState(null);
 
   const computedStart = useMemo(() => {
     if (!room) return null;
+    if (customStart) return customStart;
     const cur = currentBooking(room.id, bookings, now);
     if (cur) return new Date(cur.end);
     return roundToNext15(now);
-  }, [room, bookings, now]);
+  }, [room, customStart, bookings, now]);
 
   const computedEnd = useMemo(() => {
     if (!computedStart) return null;
@@ -738,10 +795,27 @@ function BookingSheet({ room, bookings, now, userEmail, onClose }) {
     return bookings.find(b => b.roomId === room.id && b.start < computedEnd && b.end > computedStart) || null;
   }, [room, bookings, computedStart, computedEnd]);
 
+  // 過去時刻のチェック（情報提示のみ、ブロックはしない）
+  const isPast = computedStart && computedStart < now;
+
+  const handleStartTimeChange = (e) => {
+    const value = e.target.value; // "HH:MM"
+    if (!value) return;
+    const [h, m] = value.split(':').map(Number);
+    if (isNaN(h) || isNaN(m)) return;
+    const newStart = new Date(now);
+    newStart.setHours(h, m, 0, 0);
+    setCustomStart(newStart);
+  };
+
   useEffect(() => {
     if (!room) return;
     setTitle('');
     setDuration(60);
+    setCustomStart(null);
+    setSubmitting(false);
+    setSubmitted(false);
+    setSubmitError(null);
   }, [room]);
 
   if (!room) return null;
@@ -756,14 +830,29 @@ function BookingSheet({ room, bookings, now, userEmail, onClose }) {
     'このイベントは社内会議室予約システムから登録されました。',
   ].filter(Boolean).join('\n');
 
-  const gcalUrl = makeGcalUrl({
-    title: effectiveTitle,
-    start: computedStart,
-    end: computedEnd,
-    location,
-    details,
-    attendeeEmail: room.calendarId, // ← 会議室を招待者として追加（自動的にリソース予約になる）
-  });
+  const handleSubmit = async () => {
+    if (conflict || submitting || submitted) return;
+    setSubmitting(true);
+    setSubmitError(null);
+    try {
+      await createBooking({
+        title: effectiveTitle,
+        start: computedStart,
+        end: computedEnd,
+        location,
+        description: details,
+        roomCalendarId: room.calendarId,
+      });
+      setSubmitted(true);
+      // 成功表示を1.2秒見せてから閉じる
+      setTimeout(() => onClose(), 1200);
+    } catch (e) {
+      setSubmitError(e.message || '予約に失敗しました');
+      setSubmitting(false);
+    }
+  };
+
+  const ctaDisabled = !!conflict || submitting || submitted;
 
   return (
     <div className="kr-sheet-backdrop" onClick={onClose}>
@@ -787,14 +876,34 @@ function BookingSheet({ room, bookings, now, userEmail, onClose }) {
 
         <div className="kr-sheet-body">
           <div className="kr-field">
-            <div className="kr-field-label">開始時刻</div>
+            <div className="kr-field-row">
+              <div className="kr-field-label">開始時刻</div>
+              {customStart && (
+                <button type="button" className="kr-field-reset" onClick={() => setCustomStart(null)}>
+                  自動に戻す
+                </button>
+              )}
+            </div>
             <div className="kr-time-display">
-              <span className="kr-mono kr-time-big">{fmtTime(computedStart)}</span>
+              <input
+                type="time"
+                value={fmtTime(computedStart)}
+                onChange={handleStartTimeChange}
+                step="900"
+                className="kr-time-input"
+                aria-label="開始時刻"
+              />
               <span className="kr-arrow">→</span>
               <span className="kr-mono kr-time-big">{fmtTime(computedEnd)}</span>
             </div>
             <div className="kr-field-hint">
-              {currentBooking(room.id, bookings, now) ? '現在の予約終了直後から' : '次の15分から自動セット'}
+              {isPast
+                ? '⚠ 開始時刻が現在より前です'
+                : customStart
+                  ? '手動で設定済み'
+                  : currentBooking(room.id, bookings, now)
+                    ? '現在の予約終了直後から（タップして変更可能）'
+                    : '次の15分から自動セット（タップして変更可能）'}
             </div>
           </div>
 
@@ -836,22 +945,39 @@ function BookingSheet({ room, bookings, now, userEmail, onClose }) {
         </div>
 
         <div className="kr-sheet-foot">
-          <a
-            href={conflict ? undefined : gcalUrl}
-            target="_blank"
-            rel="noopener noreferrer"
-            className={`kr-cta-primary ${conflict ? 'kr-cta-disabled' : ''}`}
-            onClick={(e) => {
-              if (conflict) { e.preventDefault(); return; }
-              setTimeout(onClose, 200);
-            }}
+          {submitError && (
+            <div className="kr-submit-error">
+              <AlertCircle size={14} strokeWidth={1.8} />
+              <span>{submitError}</span>
+            </div>
+          )}
+          <button
+            type="button"
+            className={`kr-cta-primary ${ctaDisabled ? 'kr-cta-disabled' : ''} ${submitted ? 'kr-cta-done' : ''}`}
+            disabled={ctaDisabled}
+            onClick={handleSubmit}
           >
-            <Sparkles size={16} strokeWidth={1.8} />
-            Googleカレンダーで予約する
-            <ArrowUpRight size={16} strokeWidth={2} />
-          </a>
+            {submitted ? (
+              <>
+                <Check size={16} strokeWidth={2.2} />
+                予約完了
+              </>
+            ) : submitting ? (
+              <>
+                <Loader2 size={16} strokeWidth={1.8} className="kr-spin" />
+                予約中…
+              </>
+            ) : (
+              <>
+                <Sparkles size={16} strokeWidth={1.8} />
+                この内容で予約する
+              </>
+            )}
+          </button>
           <div className="kr-cta-hint">
-            別タブで開きます。「保存」ボタンを押せば完了です。
+            {submitted
+              ? 'Googleカレンダーに登録されました'
+              : 'タップするとGoogleカレンダーに直接登録されます'}
           </div>
         </div>
       </div>
@@ -1001,6 +1127,39 @@ function GlobalStyles() {
       .kr-time-display { display: flex; align-items: center; gap: 12px; padding: 14px 16px; background: var(--surface); border: 1px solid var(--border); border-radius: 4px; }
       .kr-time-big { font-size: 26px; font-weight: 500; letter-spacing: 0.02em; }
       .kr-arrow { color: var(--ink-faint); font-size: 18px; }
+      .kr-time-input {
+        font-family: var(--mono);
+        font-variant-numeric: tabular-nums;
+        font-size: 26px;
+        font-weight: 500;
+        letter-spacing: 0.02em;
+        color: var(--ink);
+        background: transparent;
+        border: none;
+        outline: none;
+        padding: 0;
+        cursor: pointer;
+        min-width: 110px;
+        -webkit-appearance: none;
+      }
+      .kr-time-input:focus { color: var(--matcha-ink); }
+      .kr-time-input::-webkit-calendar-picker-indicator { cursor: pointer; opacity: 0.45; padding: 0 4px; }
+      .kr-time-input::-webkit-calendar-picker-indicator:hover { opacity: 0.85; }
+      .kr-field-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; gap: 12px; }
+      .kr-field-row .kr-field-label { margin-bottom: 0; }
+      .kr-field-reset {
+        background: transparent;
+        border: 1px solid var(--border);
+        color: var(--ink-soft);
+        font-family: inherit;
+        font-size: 10px;
+        padding: 4px 10px;
+        border-radius: 999px;
+        cursor: pointer;
+        transition: all 0.12s;
+        white-space: nowrap;
+      }
+      .kr-field-reset:hover { border-color: var(--ink); color: var(--ink); }
       .kr-duration-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; margin-bottom: 10px; }
       @media (max-width: 420px) { .kr-duration-grid { grid-template-columns: repeat(3, 1fr); } }
       .kr-dur { padding: 10px 4px; background: var(--surface); border: 1px solid var(--border); border-radius: 3px; font-family: inherit; font-size: 12px; font-weight: 500; color: var(--ink-soft); cursor: pointer; transition: all 0.12s; }
@@ -1027,6 +1186,9 @@ function GlobalStyles() {
       .kr-cta-primary:active { transform: scale(0.99); }
       .kr-cta-disabled { background: var(--ink-faint); cursor: not-allowed; pointer-events: auto; }
       .kr-cta-disabled:hover { background: var(--ink-faint); }
+      .kr-cta-done { background: var(--matcha-ink) !important; cursor: default; }
+      .kr-cta-done:hover { background: var(--matcha-ink) !important; }
+      .kr-submit-error { display: flex; align-items: flex-start; gap: 8px; background: var(--beni-bg); border-left: 3px solid var(--beni); color: var(--beni-ink); padding: 10px 12px; border-radius: 3px; font-size: 12px; line-height: 1.5; margin-bottom: 12px; }
       .kr-cta-hint { text-align: center; font-size: 10px; color: var(--ink-mute); margin-top: 10px; letter-spacing: 0.08em; }
 
       /* Login */
