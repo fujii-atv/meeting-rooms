@@ -25,6 +25,9 @@ const ROOMS = [
   { id: 5, name: '3F会議室', reading: 'atv-3f-third floor',   capacity: 2,  floor: '3F', equipment: ['プロジェクター', 'ホワイトボード'],               calendarId: import.meta.env.VITE_ROOM_5_CAL_ID },
 ].filter(r => r.calendarId); // calendarId が未設定の会議室は表示しない
 
+// ROOMSから階数を自動抽出（重複除去・ソート済み）。会議室を増減すると自動的にフィルターも追従する
+const FLOORS = [...new Set(ROOMS.map(r => r.floor))].sort();
+
 const SCOPES = 'https://www.googleapis.com/auth/calendar.readonly openid profile email';
 const REFRESH_INTERVAL_MS = 60 * 1000; // 1分ごとに予約状況を再取得
 
@@ -560,8 +563,7 @@ function FilterBar({ filter, setFilter, availableCount }) {
   const opts = [
     { id: 'all',  label: 'すべて' },
     { id: 'free', label: `空き ${availableCount}` },
-    { id: '3F',   label: '3F' },
-    { id: '4F',   label: '4F' },
+    ...FLOORS.map(f => ({ id: f, label: f })),
   ];
   return (
     <div className="kr-filter">
